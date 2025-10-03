@@ -107,3 +107,40 @@ pub struct StreamingResponse {
     pub detections: Option<Detections>,
     pub warnings: Option<Vec<HashMap<String, String>>>,
 }
+
+// Sentence chunker structures
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ChunkResult {
+    pub start: Option<String>,
+    pub end: String,
+    pub text: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ChunkerResponse {
+    pub results: Vec<ChunkResult>,
+    pub token_count: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ChunkedMessage {
+    pub content: String,
+    pub chunks: Option<ChunkerResponse>,
+    pub role: String,
+    pub tool_calls: Option<serde_json::Value>,
+    pub audio: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ChunkedChatRequest {
+    pub model: String,
+    pub messages: Vec<ChunkedMessage>,
+    pub stream: Option<bool>,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub stop: Option<Vec<String>>,
+    pub user: Option<String>,
+}

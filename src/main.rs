@@ -25,8 +25,39 @@ mod config;
 
 use api::{
     Detections, GenerationChoice, GenerationMessage, OrchestratorDetector, OrchestratorResponse,
-    StreamingResponse, StreamingDelta,
+    StreamingResponse, StreamingDelta, ChunkedChatRequest, ChunkedMessage, ChunkerResponse, ChunkResult,
 };
+
+// Helper function to process chunked messages
+fn process_chunked_messages(messages: Vec<ChunkedMessage>) -> Vec<serde_json::Value> {
+    let mut processed_messages = Vec::new();
+
+    for message in messages {
+        let mut message_obj = serde_json::Map::new();
+        message_obj.insert("role".to_string(), serde_json::Value::String(message.role));
+        message_obj.insert("content".to_string(), serde_json::Value::String(message.content));
+
+        // Add chunks information if present
+        if let Some(chunks) = message.chunks {
+            let chunks_value = serde_json::to_value(chunks).unwrap_or(serde_json::Value::Null);
+            message_obj.insert("chunks".to_string(), chunks_value);
+        }
+
+        // Add tool_calls if present
+        if let Some(tool_calls) = message.tool_calls {
+            message_obj.insert("tool_calls".to_string(), tool_calls);
+        }
+
+        // Add audio if present
+        if let Some(audio) = message.audio {
+            message_obj.insert("audio".to_string(), audio);
+        }
+
+        processed_messages.push(serde_json::Value::Object(message_obj));
+    }
+
+    processed_messages
+}
 
 fn get_orchestrator_detectors(
     detectors: Vec<String>,
@@ -160,6 +191,20 @@ async fn handle_chat_completions(
 ) -> Result<Response, (StatusCode, String)> {
     tracing::debug!("handle_chat_completions called with payload: {:?}", payload);
 
+    // Check if this is a chunked request by looking for chunked messages
+    let is_chunked = payload
+        .as_object()
+        .and_then(|obj| obj.get("messages"))
+        .and_then(|messages| messages.as_array())
+        .map(|messages| {
+            messages.iter().any(|msg| {
+                msg.as_object()
+                    .and_then(|msg_obj| msg_obj.get("chunks"))
+                    .is_some()
+            })
+        })
+        .unwrap_or(false);
+
     // Check if streaming is requested
     let is_streaming = payload
         .as_object()
@@ -167,7 +212,25 @@ async fn handle_chat_completions(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    if is_streaming {
+    tracing::debug!("Request type - Chunked: {}, Streaming: {}", is_chunked, is_streaming);
+
+    if is_chunked {
+        // Handle chunked request (can be streaming or non-streaming)
+        let result = handle_chunked_generation(
+            headers,
+            Json(payload),
+            detectors,
+            gateway_config,
+            route_fallback_message,
+            orchestrator_client,
+            scheme,
+            is_streaming,
+        ).await;
+        match result {
+            Ok(response) => Ok(response.into_response()),
+            Err(e) => Err(e),
+        }
+    } else if is_streaming {
         let result = handle_streaming_generation(
             headers,
             Json(payload),
@@ -194,6 +257,141 @@ async fn handle_chat_completions(
         match result {
             Ok(response) => Ok(response.into_response()),
             Err(e) => Err(e),
+        }
+    }
+}
+
+async fn handle_chunked_generation(
+    headers: HeaderMap,
+    Json(mut payload): Json<serde_json::Value>,
+    detectors: Vec<String>,
+    gateway_config: GatewayConfig,
+    route_fallback_message: Option<String>,
+    orchestrator_client: Arc<reqwest::Client>,
+    scheme: String,
+    is_streaming: bool,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    tracing::debug!("handle_chunked_generation called with payload: {:?}", payload);
+
+    let orchestrator_detectors =
+        get_orchestrator_detectors(detectors.clone(), gateway_config.detectors.clone());
+    tracing::debug!("Orchestrator detectors: {:?}", orchestrator_detectors);
+
+    // Process chunked messages
+    if let Some(messages) = payload.as_object_mut().and_then(|obj| obj.get_mut("messages")) {
+        if let Some(messages_array) = messages.as_array_mut() {
+            for message in messages_array.iter_mut() {
+                if let Some(message_obj) = message.as_object_mut() {
+                    // If this message has chunks, we need to process them
+                    if let Some(chunks) = message_obj.get("chunks") {
+                        tracing::debug!("Processing chunked message with chunks: {:?}", chunks);
+
+                        // For now, we'll pass the chunks through to the orchestrator
+                        // The orchestrator can decide how to handle the chunked data
+                        // This allows for future enhancement where the gateway could
+                        // process chunks individually or aggregate them
+                    }
+                }
+            }
+        }
+    }
+
+    let mut payload = payload.as_object_mut();
+
+    let url: String = match gateway_config.orchestrator.port {
+        Some(port) => format!(
+            "{}://{}:{}/api/v2/chat/completions-detection",
+            scheme,
+            gateway_config.orchestrator.host,
+            port
+        ),
+        None => format!(
+            "{}://{}/api/v2/chat/completions-detection",
+            scheme,
+            gateway_config.orchestrator.host
+        ),
+    };
+    tracing::debug!("Orchestrator URL: {}", url);
+
+    payload.as_mut().unwrap().insert(
+        "detectors".to_string(),
+        serde_json::to_value(&orchestrator_detectors).unwrap(),
+    );
+    tracing::debug!("Payload after inserting detectors: {:?}", payload);
+
+    if is_streaming {
+        // Handle streaming chunked response
+        let response_result =
+            orchestrator_streaming_request(payload, &headers, &url, &orchestrator_client).await;
+
+        match response_result {
+            Ok(stream) => {
+                let sse_stream = stream.map(move |chunk_result| -> Result<Event, anyhow::Error> {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            // Check if we need to apply fallback message
+                            if let Ok(mut streaming_response) = serde_json::from_str::<StreamingResponse>(&chunk) {
+                                if let Some(fallback_message) = &route_fallback_message {
+                                    if streaming_response.detections.is_some() {
+                                        // Apply fallback message to the first chunk
+                                        if streaming_response.choices.len() > 0 {
+                                            streaming_response.choices[0].delta = StreamingDelta {
+                                                content: Some(fallback_message.clone()),
+                                                role: Some("assistant".to_string()),
+                                                tool_calls: None,
+                                            };
+                                            streaming_response.choices[0].finish_reason = Some("stop".to_string());
+                                        }
+                                    }
+                                }
+
+                                match serde_json::to_string(&streaming_response) {
+                                    Ok(json_str) => Ok(Event::default().data(json_str)),
+                                    Err(e) => {
+                                        tracing::error!("Failed to serialize streaming response: {}", e);
+                                        Ok(Event::default().data("{\"error\": \"serialization failed\"}"))
+                                    }
+                                }
+                            } else {
+                                // If it's not a valid JSON chunk, pass it through as-is
+                                Ok(Event::default().data(chunk))
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Error processing streaming chunk: {}", e);
+                            Ok(Event::default().data(format!("{{\"error\": \"{}\"}}", e)))
+                        }
+                    }
+                });
+
+                Ok(Sse::new(sse_stream)
+                    .keep_alive(KeepAlive::default())
+                    .into_response())
+            }
+            Err(e) => {
+                tracing::error!("Streaming chunked request failed: {}", e);
+                Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+            }
+        }
+    } else {
+        // Handle non-streaming chunked response
+        let response_result =
+            orchestrator_post_request(payload, &headers, &url, &orchestrator_client).await;
+
+        match response_result {
+            Ok(mut orchestrator_response) => {
+                let detection =
+                    check_payload_detections(&orchestrator_response.detections, route_fallback_message);
+                if let Some(message) = detection {
+                    tracing::debug!("Fallback message triggered: {:?}", message);
+                    orchestrator_response.choices = vec![message];
+                }
+                Ok(Json(json!(orchestrator_response)).into_response())
+            }
+            Err(_) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                response_result.err().unwrap().to_string(),
+            )),
         }
     }
 }
